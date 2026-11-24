@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
+import time
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -38,6 +40,9 @@ POLL_SECONDS = max(5, int(os.getenv("POLL_SECONDS", "10")))
 PROVIDER = os.getenv("AVIATION_PROVIDER", "airplanes_live").lower()
 OPEN_SKY_CLIENT_ID = os.getenv("OPENSKY_CLIENT_ID", "")
 OPEN_SKY_CLIENT_SECRET = os.getenv("OPENSKY_CLIENT_SECRET", "")
+OPENSKY_WRITTEN_LICENSE = os.getenv("OPENSKY_WRITTEN_LICENSE", "false").lower() == "true"
+_opensky_token: str | None = None
+_opensky_token_expires = 0.0
 
 
 class Base(DeclarativeBase):
@@ -119,8 +124,19 @@ async def collect() -> None:
     now = datetime.now(timezone.utc)
     async with httpx.AsyncClient(timeout=12) as client:
         if PROVIDER == "opensky":
-            auth = (OPEN_SKY_CLIENT_ID, OPEN_SKY_CLIENT_SECRET) if OPEN_SKY_CLIENT_ID and OPEN_SKY_CLIENT_SECRET else None
-            response = await client.get("https://opensky-network.org/api/states/all", auth=auth)
+            if not OPENSKY_WRITTEN_LICENSE:
+                raise RuntimeError("OpenSky REST ingestion requires a written license; see OpenSky terms")
+            if not OPEN_SKY_CLIENT_ID or not OPEN_SKY_CLIENT_SECRET:
+                raise RuntimeError("OpenSky client credentials are required")
+            token = await opensky_access_token(client)
+            lat = float(os.getenv("OBSERVE_LAT", "18.52"))
+            lon = float(os.getenv("OBSERVE_LON", "73.86"))
+            radius_deg = min(250, max(1, int(os.getenv("OBSERVE_RADIUS_NM", "100")))) / 60
+            lon_delta = radius_deg / max(0.01, abs(math.cos(math.radians(lat))))
+            response = await client.get("https://opensky-network.org/api/states/all", params={
+                "lamin": max(-90, lat - radius_deg), "lamax": min(90, lat + radius_deg),
+                "lomin": max(-180, lon - lon_delta), "lomax": min(180, lon + lon_delta)},
+                headers={"Authorization": f"Bearer {token}"})
             response.raise_for_status()
             rows = [normalize_opensky(s) for s in response.json().get("states", [])]
         else:
@@ -156,6 +172,21 @@ async def collect() -> None:
     current = [Aircraft.model_validate(row).model_dump(mode="json") for row in objects]
     hub.state.update(status="online", provider=PROVIDER, last_success=now.isoformat(), last_error=None, count=len(current))
     await hub.broadcast({"type": "aircraft", "provider": PROVIDER, "observed_at": now.isoformat(), "aircraft": current})
+
+
+async def opensky_access_token(client: httpx.AsyncClient) -> str:
+    """Get and cache an OpenSky OAuth2 client-credentials token."""
+    global _opensky_token, _opensky_token_expires
+    if _opensky_token and time.monotonic() < _opensky_token_expires - 60:
+        return _opensky_token
+    response = await client.post("https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token",
+                                 data={"grant_type": "client_credentials", "client_id": OPEN_SKY_CLIENT_ID,
+                                       "client_secret": OPEN_SKY_CLIENT_SECRET})
+    response.raise_for_status()
+    payload = response.json()
+    _opensky_token = payload["access_token"]
+    _opensky_token_expires = time.monotonic() + float(payload.get("expires_in", 1800))
+    return _opensky_token
 
 
 async def ingestion_loop() -> None:
