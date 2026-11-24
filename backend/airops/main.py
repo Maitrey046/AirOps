@@ -36,8 +36,12 @@ log = logging.getLogger("airops")
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./airops.db")
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}, pool_pre_ping=True)
 Session = sessionmaker(engine, expire_on_commit=False)
-POLL_SECONDS = max(5, int(os.getenv("POLL_SECONDS", "10")))
+POLL_SECONDS = max(10, int(os.getenv("POLL_SECONDS", "10")))
 PROVIDER = os.getenv("AVIATION_PROVIDER", "airplanes_live").lower()
+PROVIDER_ORDER = list(dict.fromkeys([PROVIDER] + [p.strip().lower() for p in os.getenv("AVIATION_FALLBACKS", "adsbfi,adsblol").split(",") if p.strip()]))
+PROVIDER_NAMES = {"airplanes_live": "Airplanes.Live", "adsbfi": "ADSB.fi", "adsblol": "ADS-B.lol", "opensky": "OpenSky"}
+PROVIDER_RETRY_AT: dict[str, float] = {}
+PROVIDER_FAILURES: dict[str, int] = {}
 OPEN_SKY_CLIENT_ID = os.getenv("OPENSKY_CLIENT_ID", "")
 OPEN_SKY_CLIENT_SECRET = os.getenv("OPENSKY_CLIENT_SECRET", "")
 OPENSKY_WRITTEN_LICENSE = os.getenv("OPENSKY_WRITTEN_LICENSE", "false").lower() == "true"
@@ -102,7 +106,7 @@ class Aircraft(BaseModel):
 class Hub:
     def __init__(self) -> None:
         self.clients: set[WebSocket] = set()
-        self.state: dict[str, Any] = {"provider": PROVIDER, "status": "starting", "last_success": None, "last_error": None, "count": 0}
+        self.state: dict[str, Any] = {"provider": None, "provider_order": [PROVIDER_NAMES.get(p, p) for p in PROVIDER_ORDER], "status": "starting", "last_success": None, "last_error": None, "count": 0}
         self.lock = asyncio.Lock()
 
     async def broadcast(self, payload: dict[str, Any]) -> None:
@@ -120,31 +124,65 @@ hub = Hub()
 
 
 async def collect() -> None:
-    """One broad-area poll; production deployments should partition by configured regions."""
+    """Try configured providers in order and persist the first successful response."""
     now = datetime.now(timezone.utc)
+    lat, lon = float(os.getenv("OBSERVE_LAT", "18.52")), float(os.getenv("OBSERVE_LON", "73.86"))
+    radius = min(250, max(1, int(os.getenv("OBSERVE_RADIUS_NM", "100"))))
+    rows = None
+    chosen_provider = None
+    errors = []
     async with httpx.AsyncClient(timeout=12) as client:
-        if PROVIDER == "opensky":
-            if not OPENSKY_WRITTEN_LICENSE:
-                raise RuntimeError("OpenSky REST ingestion requires a written license; see OpenSky terms")
-            if not OPEN_SKY_CLIENT_ID or not OPEN_SKY_CLIENT_SECRET:
-                raise RuntimeError("OpenSky client credentials are required")
-            token = await opensky_access_token(client)
-            lat = float(os.getenv("OBSERVE_LAT", "18.52"))
-            lon = float(os.getenv("OBSERVE_LON", "73.86"))
-            radius_deg = min(250, max(1, int(os.getenv("OBSERVE_RADIUS_NM", "100")))) / 60
-            lon_delta = radius_deg / max(0.01, abs(math.cos(math.radians(lat))))
-            response = await client.get("https://opensky-network.org/api/states/all", params={
-                "lamin": max(-90, lat - radius_deg), "lamax": min(90, lat + radius_deg),
-                "lomin": max(-180, lon - lon_delta), "lomax": min(180, lon + lon_delta)},
-                headers={"Authorization": f"Bearer {token}"})
-            response.raise_for_status()
-            rows = [normalize_opensky(s) for s in response.json().get("states", [])]
-        else:
-            # Airplanes.Live point endpoint has bounded radius; default to Pune/100 km.
-            lat, lon, radius = float(os.getenv("OBSERVE_LAT", "18.52")), float(os.getenv("OBSERVE_LON", "73.86")), min(250, max(1, int(os.getenv("OBSERVE_RADIUS_NM", "100"))))
-            response = await client.get(f"https://api.airplanes.live/v2/point/{lat}/{lon}/{radius}")
-            response.raise_for_status()
-            rows = [normalize_airplanes(a) for a in response.json().get("ac", [])]
+        for source in PROVIDER_ORDER:
+            if PROVIDER_RETRY_AT.get(source, 0) > time.monotonic():
+                continue
+            response = None
+            try:
+                if source == "opensky":
+                    if not OPENSKY_WRITTEN_LICENSE:
+                        raise RuntimeError("OpenSky requires a written license")
+                    if not OPEN_SKY_CLIENT_ID or not OPEN_SKY_CLIENT_SECRET:
+                        raise RuntimeError("OpenSky OAuth2 credentials are missing")
+                    token = await opensky_access_token(client)
+                    radius_deg = radius / 60
+                    lon_delta = radius_deg / max(0.01, abs(math.cos(math.radians(lat))))
+                    response = await client.get("https://opensky-network.org/api/states/all", params={
+                        "lamin": max(-90, lat - radius_deg), "lamax": min(90, lat + radius_deg),
+                        "lomin": max(-180, lon - lon_delta), "lomax": min(180, lon + lon_delta)},
+                        headers={"Authorization": f"Bearer {token}"})
+                    response.raise_for_status()
+                    rows = [normalize_opensky(s) for s in response.json().get("states", [])]
+                else:
+                    if source == "airplanes_live":
+                        url = f"https://api.airplanes.live/v2/point/{lat}/{lon}/{radius}"
+                    elif source == "adsbfi":
+                        url = f"https://opendata.adsb.fi/api/v3/lat/{lat}/lon/{lon}/dist/{radius}"
+                    elif source == "adsblol":
+                        url = f"https://api.adsb.lol/v2/lat/{lat}/lon/{lon}/dist/{radius}"
+                    else:
+                        raise ValueError(f"Unknown aircraft provider: {source}")
+                    response = await client.get(url)
+                    response.raise_for_status()
+                    body = response.json()
+                    rows = [normalize_airplanes(a) for a in (body.get("ac") or body.get("aircraft") or [])]
+                chosen_provider = source
+                PROVIDER_FAILURES[source] = 0
+                min_seconds = 180 if source == "adsblol" else 15 if source == "adsbfi" else POLL_SECONDS
+                PROVIDER_RETRY_AT[source] = time.monotonic() + min_seconds
+                break
+            except Exception as exc:
+                errors.append(f"{PROVIDER_NAMES.get(source, source)}: {type(exc).__name__}")
+                attempts = PROVIDER_FAILURES.get(source, 0) + 1
+                PROVIDER_FAILURES[source] = attempts
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                retry_after = getattr(getattr(exc, "response", None), "headers", {}).get("Retry-After", 0)
+                try:
+                    retry_seconds = int(float(retry_after or 0))
+                except (TypeError, ValueError):
+                    retry_seconds = 0
+                seconds = max(60, retry_seconds) if status == 429 else 300 if status == 403 else min(30 * 2 ** (attempts - 1), 600)
+                PROVIDER_RETRY_AT[source] = time.monotonic() + seconds
+        if chosen_provider is None:
+            raise RuntimeError("No aircraft provider responded: " + "; ".join(errors or ["all sources are cooling down"]))
     valid = [r for r in rows if r and r["icao"]]
     # Deduplicate provider responses by ICAO within each poll, keeping the final record.
     by_icao = {r["icao"]: r for r in valid}
@@ -159,7 +197,7 @@ async def collect() -> None:
             observed = now
         known = {k: v for k, v in r.items() if k not in ("icao",) and v is not None}
         all_fields = ["callsign", "registration", "aircraft_type", "operator", "latitude", "longitude", "altitude_ft", "ground_speed_kt", "track_deg", "vertical_rate_fpm", "squawk"]
-        objects.append(Observation(**r, provider=PROVIDER, observed_at=observed, received_at=received,
+        objects.append(Observation(**r, provider=chosen_provider, observed_at=observed, received_at=received,
                                    freshness_seconds=max(0, int((received - observed).total_seconds())),
                                    available_fields=sorted(known), missing_fields=[f for f in all_fields if f not in known],
                                    evidence_type="provider-reported"))
@@ -170,8 +208,8 @@ async def collect() -> None:
     finally:
         db.close()
     current = [Aircraft.model_validate(row).model_dump(mode="json") for row in objects]
-    hub.state.update(status="online", provider=PROVIDER, last_success=now.isoformat(), last_error=None, count=len(current))
-    await hub.broadcast({"type": "aircraft", "provider": PROVIDER, "observed_at": now.isoformat(), "aircraft": current})
+    hub.state.update(status="online", provider=chosen_provider, provider_name=PROVIDER_NAMES[chosen_provider], last_success=now.isoformat(), last_error=None, count=len(current))
+    await hub.broadcast({"type": "aircraft", "provider": chosen_provider, "provider_name": PROVIDER_NAMES[chosen_provider], "observed_at": now.isoformat(), "aircraft": current})
 
 
 async def opensky_access_token(client: httpx.AsyncClient) -> str:
@@ -216,6 +254,12 @@ app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=Fals
 @app.get("/", include_in_schema=False)
 def home() -> FileResponse:
     return FileResponse(Path(__file__).resolve().parents[2] / "index.html")
+
+
+@app.get("/sw.js", include_in_schema=False)
+def service_worker() -> FileResponse:
+    return FileResponse(Path(__file__).resolve().parents[2] / "sw.js", media_type="application/javascript",
+                        headers={"Service-Worker-Allowed": "/"})
 
 
 @app.get("/api/status")

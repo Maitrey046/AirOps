@@ -25,6 +25,10 @@ html,body{height:100%;margin:0;font:15px/1.35 -apple-system,BlinkMacSystemFont,"
 .ib.on{background:var(--blue);color:#fff}
 .panel{position:fixed;left:10px;right:10px;max-width:520px;margin:auto;bottom:calc(env(safe-area-inset-bottom,0px) + 74px);border-radius:20px;padding:10px 16px 16px;z-index:6;max-height:56vh;overflow:auto}
 .panel[hidden]{display:none}
+#cameraModal{position:fixed;inset:0;z-index:20;background:rgba(0,0,0,.82);display:flex;align-items:center;justify-content:center;padding:18px}
+#cameraModal[hidden]{display:none}
+#cameraBox{width:min(680px,100%);border-radius:18px;padding:14px}
+#camVideo{width:100%;max-height:68vh;object-fit:contain;background:#000;border-radius:12px}
 .grab{width:36px;height:5px;border-radius:3px;background:var(--sep);margin:0 auto 10px}
 .row{display:flex;justify-content:space-between;align-items:flex-start;gap:8px}
 h2{margin:0;font-size:22px;font-weight:700;letter-spacing:-.3px}
@@ -56,7 +60,7 @@ select,.in{width:100%;height:40px;border-radius:10px;border:0;background:var(--f
 <body>
 <div id="map"></div>
 <div id="top">
-  <div class="bar g"><span style="color:var(--sub)">⌕</span><input id="q" placeholder="Callsign, registration, type" autocomplete="off"><span id="n">–</span></div>
+  <div class="bar g"><span style="color:var(--sub)">⌕</span><input id="q" placeholder="Aircraft, airport or place" autocomplete="off"><span id="n">–</span></div>
   <button class="ib g" id="heat">Heat</button><button class="ib g" id="th">◐</button>
 </div>
 <button id="sourceStatus" class="g" type="button" aria-label="Data source status">Connecting to data source…</button>
@@ -64,8 +68,9 @@ select,.in{width:100%;height:40px;border-radius:10px;border:0;background:var(--f
 <div id="toast" class="g"></div>
 <div id="sheet" class="panel g" hidden></div>
 <div id="panel" class="panel g" hidden></div>
+<div id="cameraModal" hidden><div id="cameraBox" class="g"><div class="row"><h2>Spotter camera</h2><button class="x" data-a="cameraClose" aria-label="Close camera">✕</button></div><p>Camera frames stay on this device; AirOps does not upload them.</p><video id="camVideo" autoplay playsinline></video><canvas id="camCanvas" hidden></canvas><div class="btns"><button class="btn" data-a="capture">Capture photo</button><button class="btn s" data-a="cameraClose">Close</button></div></div></div>
 <nav id="tabs" class="g">
-  <button data-t="map" class="on"><i>◉</i>Map</button><button data-t="ana"><i>▥</i>Analytics</button><button data-t="alr"><i>◔</i>Alerts</button><button data-t="exp"><i>⇪</i>Export</button>
+  <button data-t="map" class="on"><i>◉</i>Map</button><button data-t="ana"><i>▥</i>Analytics</button><button data-t="alr"><i>◔</i>Alerts</button><button data-t="exp"><i>⇪</i>Export</button><button data-t="tools"><i>⋯</i>Tools</button>
 </nav>
 <script>
 const $=s=>document.querySelector(s);
@@ -73,8 +78,85 @@ const ls=(k,d)=>{try{return JSON.parse(localStorage.getItem(k))??d}catch{return 
 const sv=(k,v)=>{try{localStorage.setItem(k,JSON.stringify(v))}catch{}};
 const apiPath=p=>{const base=ls('apiBase','').trim().replace(/\/+$/,'');return base?base+p:new URL(p.replace(/^\//,''),document.baseURI).href};
 const AP={VAPO:['Pune',18.58,73.92],VABB:['Mumbai',19.09,72.87],VIDP:['Delhi',28.56,77.10],VOBL:['Bengaluru',13.2,77.71],VOHS:['Hyderabad',17.24,78.43],VOMM:['Chennai',12.99,80.17],OMDB:['Dubai',25.25,55.36],EGLL:['London Heathrow',51.47,-0.45]};
-let ac=new Map(),hist=new Map(),archivedTracks=new Set(),sel=null,watch=ls('watch',[]),emerg=ls('emerg',true),alerted=new Set(),heat=[],pbIdx=null,tab='map',apc=ls('ap','VAPO'),heatOn=false,qs='',provider='Connecting',lastSuccess=null,providerError=null;
+let ac=new Map(),hist=new Map(),archivedTracks=new Set(),sel=null,watch=ls('watch',[]),emerg=ls('emerg',true),alerted=new Set(),heat=[],pbIdx=null,tab='map',apc=ls('ap','VAPO'),heatOn=false,qs='',provider='Connecting',lastSuccess=null,providerError=null,pollPending=false,lastPollAt=0;
+const providerRetryAt=new Map(),providerFailures=new Map();
+let selectedLocation={lat:18.52,lon:73.86,name:'Pune map start'},weather=null,weatherMessage='Waiting for location…',weatherRequestedAt=0,weatherRequestSeq=0,weatherNextAllowedAt=0,nominatimNextAt=0,nominatimQueue=Promise.resolve(),wakeLock=null,keepAwake=false,compassOn=false,cameraStream=null,swRegistration=null;
+const locationCache=new Map(),weatherCache=new Map();
+const AIRCRAFT_FEEDS=[
+ {id:'airplanes',name:'Airplanes.Live',minInterval:0,url:(lat,lon,nm)=>`https://api.airplanes.live/v2/point/${lat}/${lon}/${nm}`},
+ {id:'adsbfi',name:'ADSB.fi',minInterval:1000,url:(lat,lon,nm)=>`https://opendata.adsb.fi/api/v3/lat/${lat}/lon/${lon}/dist/${nm}`},
+ {id:'adsblol',name:'ADS-B.lol',minInterval:180000,url:(lat,lon,nm)=>`https://api.adsb.lol/v2/lat/${lat}/lon/${lon}/dist/${nm}`}
+];
 const nm=(a,b,c,d)=>{const r=Math.PI/180,x=Math.sin((c-a)*r/2)**2+Math.cos(a*r)*Math.cos(c*r)*Math.sin((d-b)*r/2)**2;return 6371/1.852*2*Math.asin(Math.sqrt(x))};
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+async function fetchJson(url){const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),5000);try{const r=await fetch(url,{signal:controller.signal});if(!r.ok){const e=Error(`HTTP ${r.status}`);e.status=r.status;e.retryAfter=r.headers.get('Retry-After');throw e}return await r.json()}finally{clearTimeout(timer)}}
+async function fetchAircraftPayload(url){const data=await fetchJson(url);if(!Array.isArray(data?.ac??data?.aircraft))throw Error('unexpected aircraft response format');return data}
+async function fetchWithCorsFallback(url){
+ try{return{data:await fetchAircraftPayload(url),transport:'direct'}}catch(err){if(err.status)throw err;let last=err;
+  const proxies=[['Vercel proxy',u=>`https://radar-046-proxy.vercel.app/?url=${encodeURIComponent(u)}`],['AllOrigins',u=>`https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`]];
+  for(const [name,build] of proxies){try{return{data:await fetchAircraftPayload(build(url)),transport:name}}catch(e){last=e;if(e.status===429)break}}
+  throw Error(`direct and CORS proxy requests failed (${last.message||'network error'})`)
+ }
+}
+function normaliseFeed(rows){
+ if(!Array.isArray(rows))throw Error('unexpected aircraft response format');
+ return rows.filter(a=>a&&(a.lat??a.latitude)!=null&&(a.lon??a.lng??a.longitude)!=null).map(a=>{
+  const rawAlt=a.alt_baro??a.altitude??a.alt??0,alt=rawAlt==='ground'?0:Number(rawAlt);
+  return{id:String(a.hex??a.icao24??a.icao??'').toLowerCase(),cs:String(a.flight??a.callsign??'').trim(),reg:a.r??a.registration??'',type:a.t??a.type??'',op:a.ownOp??a.operator??a.desc??'',lat:Number(a.lat??a.latitude),lon:Number(a.lon??a.lng??a.longitude),alt:Number.isFinite(alt)?Math.round(alt):0,gs:Math.round(Number(a.gs??a.speed??0)||0),trk:Math.round(Number(a.track??a.trk??0)||0),vr:Math.round(Number(a.baro_rate??a.vr??0)||0),sq:String(a.squawk??a.sq??'')}
+ }).filter(a=>a.id&&Number.isFinite(a.lat)&&Number.isFinite(a.lon)&&Math.abs(a.lat)<=90&&Math.abs(a.lon)<=180)
+}
+async function fetchAircraftFallback(lat,lon,radius){
+ const now=Date.now(),ordered=AIRCRAFT_FEEDS,errors=[];
+ for(const feed of ordered){const until=Math.max(providerRetryAt.get(feed.id)||0,Number(ls(`feedCooldown:${feed.id}`,0)));if(until>now)continue;
+  const url=feed.url(lat.toFixed(3),lon.toFixed(3),radius);
+  try{
+   const result=await fetchWithCorsFallback(url),rows=result.data?.ac??result.data?.aircraft??result.data?.states??[],list=normaliseFeed(rows);
+   providerFailures.set(feed.id,0);providerRetryAt.set(feed.id,now+feed.minInterval);if(feed.id==='adsblol')sv(`feedCooldown:${feed.id}`,now+feed.minInterval);
+   return{list,source:feed.name,transport:result.transport}
+  }catch(err){errors.push(`${feed.name}: ${err.message}`);const failures=(providerFailures.get(feed.id)||0)+1;providerFailures.set(feed.id,failures);const retry=Math.max(0,Number(err.retryAfter)||0)*1000,delay=err.status===429?Math.max(60000,retry):err.status===403?300000:Math.min(60000*2**(failures-1),600000);providerRetryAt.set(feed.id,now+delay);sv(`feedCooldown:${feed.id}`,now+delay)}
+ }
+ const wait=Math.min(...AIRCRAFT_FEEDS.map(f=>Math.max(0,Math.max(providerRetryAt.get(f.id)||0,Number(ls(`feedCooldown:${f.id}`,0)))-now)));
+ throw Error(errors.join(' · ')||`all feeds are cooling down (retry in ${Math.ceil(wait/1000)}s)`)
+}
+function requestNominatim(url){
+ const task=nominatimQueue.then(async()=>{const delay=Math.max(0,nominatimNextAt-Date.now());if(delay)await new Promise(resolve=>setTimeout(resolve,delay));nominatimNextAt=Date.now()+1100;return fetchJson(url)});
+ nominatimQueue=task.catch(()=>{});return task
+}
+const geocoderBase=()=>ls('geocoderBase','https://nominatim.openstreetmap.org').replace(/\/+$/,'');
+async function searchPlace(query){
+ const key=query.trim().toLowerCase();try{
+  let place=locationCache.get('search:'+key);
+  if(!place){const u=new URL(`${geocoderBase()}/search`);u.search=new URLSearchParams({format:'jsonv2',limit:'1',q:query}).toString();const rows=await requestNominatim(u);place=rows?.[0];if(!place)throw Error('No matching place');locationCache.set('search:'+key,place)}
+  const lat=Number(place.lat),lon=Number(place.lon);qs='';$('#q').value='';setSelectedLocation(lat,lon,place.display_name||query,false);map.flyTo({center:[lon,lat],zoom:10});draw();toast('Map moved to '+(place.name||query));
+ }catch(e){toast('Place search failed: '+e.message)}
+}
+function setSelectedLocation(lat,lon,name,reverse=true){
+ if(!Number.isFinite(lat)||!Number.isFinite(lon)||Math.abs(lat)>90||Math.abs(lon)>180)return;
+ selectedLocation={lat,lon,name:name||`${lat.toFixed(3)}, ${lon.toFixed(3)}`};weather=null;weatherMessage='Loading weather…';loadWeather(lat,lon);
+ if(reverse)reversePlace(lat,lon);if(tab!=='map')panel();
+}
+async function reversePlace(lat,lon){
+ const key=`reverse:${lat.toFixed(3)},${lon.toFixed(3)}`;let name=locationCache.get(key);
+ try{
+  if(!name){const u=new URL(`${geocoderBase()}/reverse`);u.search=new URLSearchParams({format:'jsonv2',lat:String(lat),lon:String(lon),zoom:'10'}).toString();const result=await requestNominatim(u);name=result?.name||result?.address?.city||result?.address?.town||result?.address?.village||result?.display_name;if(!name)throw Error('No place name returned');locationCache.set(key,name)}
+ }catch{
+  try{if(!name){const result=await fetchJson(`https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=${lat}&longitude=${lon}&localityLanguage=en`);name=result.city||result.locality||result.principalSubdivision||result.countryName;if(name)locationCache.set(key,name)}}catch{}
+ }
+ if(name&&selectedLocation.lat===lat&&selectedLocation.lon===lon){selectedLocation.name=name;if(tab!=='map')panel()}
+}
+async function loadWeather(lat,lon){
+ const key=`${lat.toFixed(2)},${lon.toFixed(2)}`,cached=weatherCache.get(key);
+ if(cached&&Date.now()-cached.at<900000){weather=cached.data;weatherRequestedAt=cached.at;weatherMessage='';if(tab!=='map')panel();return}
+ if(Date.now()<weatherNextAllowedAt){weatherMessage='Weather refresh is rate-limited; try again in a few seconds.';if(tab!=='map')panel();return}
+ weatherNextAllowedAt=Date.now()+15000;
+ const requestId=++weatherRequestSeq;weatherRequestedAt=requestId;
+ try{
+  const query=new URLSearchParams({latitude:lat.toFixed(4),longitude:lon.toFixed(4),current:'temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,weather_code,wind_speed_10m,wind_direction_10m',timezone:'auto'});
+  const data=await fetchJson(`https://api.open-meteo.com/v1/forecast?${query}`);if(!data.current)throw Error('Current conditions unavailable');
+  const at=Date.now();if(weatherRequestedAt===requestId){weather=data.current;weatherCache.set(key,{data:weather,at});weatherMessage=''}
+ }catch(e){if(weatherRequestedAt===requestId){weather=null;weatherMessage='Weather unavailable: '+e.message}}
+ if(weatherRequestedAt===requestId&&tab!=='map')panel();
+}
 const fc=f=>({type:'FeatureCollection',features:f});
 const pt=(lon,lat,p={})=>({type:'Feature',properties:p,geometry:{type:'Point',coordinates:[lon,lat]}});
 const tile=()=>({type:'raster',tileSize:256,attribution:'© OpenStreetMap contributors',tiles:['https://tile.openstreetmap.org/{z}/{x}/{y}.png']});
@@ -96,28 +178,33 @@ map.on('load',()=>{
  map.addSource('pb',{type:'geojson',data:fc([])});
  map.addLayer({id:'pb',type:'circle',source:'pb',paint:{'circle-radius':7,'circle-color':'#fff','circle-stroke-color':'#0a84ff','circle-stroke-width':3}});
  map.on('click','ac',e=>open(e.features[0].properties.id));
- map.on('click',e=>{if(!map.queryRenderedFeatures(e.point,{layers:['ac']}).length)close()});
+ map.on('click',e=>{if(!map.queryRenderedFeatures(e.point,{layers:['ac']}).length){close();setSelectedLocation(e.lngLat.lat,e.lngLat.lng,'Selected map point',true)}});
  map.on('mouseenter','ac',()=>map.getCanvas().style.cursor='pointer');
  map.on('mouseleave','ac',()=>map.getCanvas().style.cursor='');
+ registerServiceWorker();
+ document.addEventListener('fullscreenchange',()=>map.resize());
+ navigator.serviceWorker?.addEventListener('message',e=>{if(e.data?.type==='AIR_OPS_REFRESH')poll()});
  let t;map.on('moveend',()=>{clearTimeout(t);t=setTimeout(poll,600)});
- navigator.geolocation?.getCurrentPosition(p=>map.jumpTo({center:[p.coords.longitude,p.coords.latitude]}),()=>{},{timeout:4000});
- poll();setInterval(poll,10000);
+ if(navigator.geolocation)navigator.geolocation.getCurrentPosition(p=>{map.jumpTo({center:[p.coords.longitude,p.coords.latitude]});setSelectedLocation(p.coords.latitude,p.coords.longitude,'Selected device location',true)},()=>loadWeather(selectedLocation.lat,selectedLocation.lon),{timeout:4000});else loadWeather(selectedLocation.lat,selectedLocation.lon);
+ poll();setInterval(poll,15000);
 });
 async function poll(){
+ const now=Date.now();if(pollPending||now-lastPollAt<15000)return;pollPending=true;lastPollAt=now;
+ try{await pollCycle()}finally{pollPending=false}
+}
+async function pollCycle(){
  if(!map.getSource('ac'))return;
- const c=map.getCenter(),b=map.getBounds();let list,used='';
+ const c=map.getCenter(),b=map.getBounds();let list,used='',sourceName='',transport='direct';
  try{
   const r=await fetch(apiPath('/api/aircraft'),{headers:{'Accept':'application/json'}});if(!r.ok)throw Error('AirOps API unavailable');
   const rows=await r.json();if(!Array.isArray(rows))throw Error('Invalid AirOps API response');
-  list=rows.filter(a=>a.latitude!=null&&a.longitude!=null&&b.contains([a.longitude,a.latitude])).map(a=>({id:a.icao,cs:a.callsign||'',reg:a.registration||'',type:a.aircraft_type||'',op:a.operator||'',lat:a.latitude,lon:a.longitude,alt:a.altitude_ft??0,gs:a.ground_speed_kt||0,trk:a.track_deg||0,vr:a.vertical_rate_fpm||0,sq:a.squawk||'',source:a.provider,observedAt:a.observed_at,receivedAt:a.received_at,freshness:a.freshness_seconds,evidenceType:a.evidence_type,availableFields:a.available_fields,missingFields:a.missing_fields}));used='AirOps API';
+  list=rows.filter(a=>a.latitude!=null&&a.longitude!=null&&b.contains([a.longitude,a.latitude])).map(a=>({id:a.icao,cs:a.callsign||'',reg:a.registration||'',type:a.aircraft_type||'',op:a.operator||'',lat:a.latitude,lon:a.longitude,alt:a.altitude_ft??0,gs:a.ground_speed_kt||0,trk:a.track_deg||0,vr:a.vertical_rate_fpm||0,sq:a.squawk||'',source:a.provider,observedAt:a.observed_at,receivedAt:a.received_at,freshness:a.freshness_seconds,evidenceType:a.evidence_type,availableFields:a.available_fields,missingFields:a.missing_fields}));
+  if(!list.length)throw Error('AirOps API has no aircraft snapshot for this map view');used='AirOps API';
  }catch{
-  try{
-   const r=Math.min(250,Math.ceil(nm(c.lat,c.lng,b.getNorth(),b.getEast())));
-   const response=await fetch(`https://api.airplanes.live/v2/point/${c.lat.toFixed(3)}/${c.lng.toFixed(3)}/${r}`);if(!response.ok)throw Error('Airplanes.Live unavailable');const j=await response.json();
-   list=(j.ac||[]).filter(a=>a.lat!=null).map(a=>({id:a.hex,cs:(a.flight||'').trim(),reg:a.r||'',type:a.t||'',op:a.ownOp||'',lat:a.lat,lon:a.lon,alt:a.alt_baro==='ground'?0:Math.round(a.alt_baro||0),gs:Math.round(a.gs||0),trk:Math.round(a.track||0),vr:a.baro_rate||0,sq:a.squawk||''}));used='Airplanes.Live';
-  }catch(err){providerError=`Airplanes.Live could not be reached (${err.message}). Configure a reachable AirOps API for a static site.`;provider='Offline';statusLabel();$('#n').textContent='Offline';return}
+  try{const radius=Math.min(250,Math.max(1,Math.ceil(nm(c.lat,c.lng,b.getNorth(),b.getEast())))),result=await fetchAircraftFallback(c.lat,c.lng,radius);list=result.list;used=result.source;sourceName=result.source;transport=result.transport}
+  catch(err){providerError=`All aircraft sources unavailable: ${err.message}. Retry later or configure a reachable AirOps API.`;provider='Offline';statusLabel();$('#n').textContent='Offline';return}
  }
- provider=used;lastSuccess=Date.now();providerError=null;statusLabel();const t=Date.now();list=list.map(a=>({...a,source:a.source||used,receivedAt:a.receivedAt||new Date(t).toISOString(),evidenceType:a.evidenceType||'provider-reported'}));ac=new Map(list.map(a=>[a.id,a]));
+ provider=transport==='direct'?used:`${used} via ${transport}`;lastSuccess=Date.now();providerError=null;statusLabel();const t=Date.now();list=list.map(a=>({...a,source:a.source||sourceName||used,receivedAt:a.receivedAt||new Date(t).toISOString(),evidenceType:a.evidenceType||'provider-reported'}));ac=new Map(list.map(a=>[a.id,a]));
  for(const a of list){const h=hist.get(a.id)||[];const l=h[h.length-1];if(!l||l[1]!==a.lon||l[2]!==a.lat){h.push([t,a.lon,a.lat,a.alt,a.gs,a.trk]);if(h.length>240)h.shift()}hist.set(a.id,h);heat.push([a.lon,a.lat]);check(a)}
  if(heat.length>15000)heat=heat.slice(-15000);
  if(hist.size>4000)for(const k of hist.keys()){if(!ac.has(k))hist.delete(k);if(hist.size<3000)break}
@@ -127,9 +214,43 @@ async function poll(){
 function statusLabel(){const e=$('#sourceStatus');if(!e)return;e.textContent=provider==='Offline'?'Offline · last update '+(lastSuccess?new Date(lastSuccess).toLocaleTimeString():'none'):provider+(lastSuccess?' · updated '+new Date(lastSuccess).toLocaleTimeString():'');e.title=providerError||'Provider-reported data. Without the AirOps API, history is held in this browser session only.';e.style.color=provider==='Offline'?'var(--red)':'var(--sub)'}
 function vis(){return[...ac.values()].filter(a=>!qs||[a.cs,a.reg,a.type,a.id,a.op].some(x=>x&&x.toLowerCase().includes(qs)))}
 function draw(){const v=vis();map.getSource('ac').setData(fc(v.map(a=>pt(a.lon,a.lat,{id:a.id,cs:a.cs,trk:a.trk,sel:a.id===sel?1:0,al:['7500','7600','7700'].includes(a.sq)}))));$('#n').textContent=v.length+' aircraft'}
+async function registerServiceWorker(){
+ if(!('serviceWorker'in navigator))return;
+ try{const workerUrl=new URL('sw.js',document.baseURI),scope=new URL('.',document.baseURI).pathname;swRegistration=await navigator.serviceWorker.register(workerUrl,{scope})}catch(e){console.info('AirOps offline shell unavailable',e.message)}
+}
+async function sendBrowserNotification(message){
+ if(!('Notification'in window)||Notification.permission!=='granted')return;
+ try{const reg=swRegistration||await navigator.serviceWorker?.ready;if(reg?.active)reg.active.postMessage({type:'AIR_OPS_NOTIFY',title:'AirOps alert',body:message});else new Notification('AirOps alert',{body:message})}catch{}
+}
+async function enableNotifications(){
+ if(!('Notification'in window)){toast('Browser notifications are not supported here.');return}
+ try{const permission=await Notification.requestPermission();toast(permission==='granted'?'Browser alerts enabled.':`Notification permission: ${permission}`);if(tab==='alr')panel()}catch(e){toast('Could not enable notifications: '+e.message)}
+}
+async function toggleWakeLock(){
+ if(!('wakeLock'in navigator)){toast('Screen Wake Lock is not supported by this browser.');return}
+ try{if(wakeLock){keepAwake=false;await wakeLock.release();wakeLock=null;toast('Keep-awake mode off.')}else{wakeLock=await navigator.wakeLock.request('screen');keepAwake=true;wakeLock.addEventListener('release',()=>{wakeLock=null;if(!keepAwake)toast('Screen lock released.')});toast('Screen will stay awake while this page is visible.')}if(tab==='tools')panel()}catch(e){keepAwake=false;toast('Wake Lock unavailable: '+e.message)}
+}
+document.addEventListener('visibilitychange',async()=>{if(document.visibilityState==='visible'&&keepAwake&&!wakeLock)try{wakeLock=await navigator.wakeLock.request('screen')}catch{keepAwake=false}});
+document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!$('#cameraModal').hidden)closeCamera()});
+function orientMap(event){const heading=event.webkitCompassHeading??(event.alpha==null?null:(360-event.alpha)%360);if(heading!=null)map.rotateTo(heading,{duration:0})}
+async function toggleCompass(){
+ if(compassOn){window.removeEventListener('deviceorientation',orientMap);compassOn=false;toast('Device compass off.');if(tab==='tools')panel();return}
+ if(!('DeviceOrientationEvent'in window)){toast('Device orientation is not available on this device.');return}
+ try{if(typeof DeviceOrientationEvent.requestPermission==='function'&&await DeviceOrientationEvent.requestPermission()!=='granted')throw Error('Permission denied');window.addEventListener('deviceorientation',orientMap);compassOn=true;toast('Map compass enabled.');if(tab==='tools')panel()}catch(e){toast('Compass unavailable: '+e.message)}
+}
+async function openCamera(){
+ if(!navigator.mediaDevices?.getUserMedia){toast('Camera access requires a supported browser on HTTPS.');return}
+ try{cameraStream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'}},audio:false});$('#camVideo').srcObject=cameraStream;$('#cameraModal').hidden=false}catch(e){toast('Camera unavailable: '+e.message)}
+}
+function closeCamera(){if(cameraStream){cameraStream.getTracks().forEach(t=>t.stop());cameraStream=null}$('#camVideo').srcObject=null;$('#cameraModal').hidden=true}
+function capturePhoto(){const v=$('#camVideo'),c=$('#camCanvas');if(!v.videoWidth){toast('Camera is not ready yet.');return}c.width=v.videoWidth;c.height=v.videoHeight;c.getContext('2d').drawImage(v,0,0);c.toBlob(blob=>{if(!blob){toast('Could not capture a photo.');return}const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=`airops-spotter-${new Date().toISOString().replace(/[:.]/g,'-')}.jpg`;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),3000)},'image/jpeg',.92)}
+async function shareAircraft(copyOnly=false){const a=ac.get(sel);if(!a)return;const text=[a.cs||a.id.toUpperCase(),a.reg,a.type,a.op,`ICAO ${a.id.toUpperCase()}`,`Source ${a.source||'unknown'}`,a.observedAt?`Observed ${a.observedAt}`:null].filter(Boolean).join(' · ');try{if(!copyOnly&&navigator.share){await navigator.share({title:'AirOps aircraft observation',text,url:location.href});return}if(navigator.clipboard?.writeText){await navigator.clipboard.writeText(text);toast('Aircraft details copied.');return}const x=document.createElement('textarea');x.value=text;document.body.append(x);x.select();const ok=document.execCommand('copy');x.remove();toast(ok?'Aircraft details copied.':'Clipboard access is unavailable.')}catch(e){if(e.name!=='AbortError')toast('Share/copy failed: '+e.message)}}
+async function enablePeriodicSync(){
+ try{const reg=swRegistration||await navigator.serviceWorker?.ready;if(!reg){toast('Service worker is unavailable. Use HTTPS or localhost.');return}if(!reg.periodicSync){toast('Periodic background sync is not supported by this browser.');return}await reg.periodicSync.register('airops-background-refresh',{minInterval:15*60*1000});toast('Background status refresh registered; the browser controls when it runs.')}catch(e){toast('Background sync unavailable: '+e.message)}
+}
 function check(a){
  const em=emerg&&['7500','7600','7700'].includes(a.sq),hit=watch.find(w=>[a.cs,a.reg,a.id].some(x=>x&&x.toUpperCase().startsWith(w)));
- if(em||hit){const k=a.id+(em?'e':hit);if(!alerted.has(k)){alerted.add(k);toast(em?`Squawk ${a.sq}: ${a.cs||a.id}`:`${a.cs||a.reg||a.id} is in range`)}}
+ if(em||hit){const message=em?`Squawk ${a.sq}: ${a.cs||a.id}`:`${a.cs||a.reg||a.id} is in range`,k=a.id+(em?'e':hit);if(!alerted.has(k)){alerted.add(k);toast(message);sendBrowserNotification(message)}}
 }
 function toast(m){const e=$('#toast');e.textContent=m;e.style.display='block';clearTimeout(e._t);e._t=setTimeout(()=>e.style.display='none',5000)}
 function open(id){
@@ -139,7 +260,7 @@ function open(id){
  <div class="grid"><div><b id="g1"></b><span>Altitude</span></div><div><b id="g2"></b><span>Ground speed</span></div><div><b id="g3"></b><span>Heading</span></div><div><b id="g4"></b><span>Vertical rate</span></div><div><b id="g5"></b><span>Squawk</span></div><div><b id="g6"></b><span>ICAO</span></div></div>
  <h3>Altitude history</h3><svg class="sp" id="sp" viewBox="0 0 300 40" preserveAspectRatio="none"></svg>
  <h3>Playback</h3><input type="range" id="pbr" min="0" value="0"><p id="pbt"></p>
- <div class="btns"><button class="btn" data-a="watch">Alert me</button><button class="btn s" data-a="trk">Export track</button></div>`;
+ <div class="btns"><button class="btn" data-a="watch">Alert me</button><button class="btn s" data-a="trk">Export track</button></div><div class="btns"><button class="btn s" data-a="share">Share</button><button class="btn s" data-a="copy">Copy details</button></div>`;
  $('#pbr').oninput=e=>{const h=hist.get(sel)||[];const i=+e.target.value;pbIdx=i>=h.length-1?null:i;stats()};
  const a=ac.get(id);if(a&&map.getZoom()<8)map.easeTo({center:[a.lon,a.lat],zoom:8});
  stats();draw();if(provider==='AirOps API'&&!archivedTracks.has(id))loadArchivedTrack(id);
@@ -176,16 +297,20 @@ function panel(){
  p.hidden=false;const v=[...ac.values()];let h='<div class="grab"></div>';
  if(tab==='ana'){
   const air=v.filter(a=>a.alt>0),avg=k=>air.length?Math.round(air.reduce((s,a)=>s+a[k],0)/air.length):0;
+  const w=weather,weatherBlock=w?`<div class="grid"><div><b>${esc(w.temperature_2m)} °C</b><span>Temperature</span></div><div><b>${esc(w.apparent_temperature)} °C</b><span>Feels like</span></div><div><b>${esc(w.relative_humidity_2m)}%</b><span>Humidity</span></div><div><b>${esc(w.wind_speed_10m)}</b><span>Wind speed</span></div><div><b>${esc(w.wind_direction_10m)}°</b><span>Wind direction</span></div><div><b>${esc(w.precipitation)} mm</b><span>Precipitation</span></div></div><p>Weather code ${esc(w.weather_code)} · <a href="https://open-meteo.com/" target="_blank" rel="noopener">Weather by Open-Meteo</a></p>`:`<p>${esc(weatherMessage)}</p><p><a href="https://open-meteo.com/" target="_blank" rel="noopener">Weather by Open-Meteo</a></p>`;
   const bands=[['Ground',a=>a.alt===0],['< 10k ft',a=>a.alt>0&&a.alt<10000],['10–25k ft',a=>a.alt>=10000&&a.alt<25000],['25–35k ft',a=>a.alt>=25000&&a.alt<35000],['35k+ ft',a=>a.alt>=35000]].map(([n,f])=>[n,v.filter(f).length]);
   const mx=Math.max(1,...bands.map(b=>b[1])),ap=AP[apc],near=v.filter(a=>nm(a.lat,a.lon,ap[1],ap[2])<30);
-  h+=`<h2>Analytics</h2><div class="grid"><div><b>${v.length}</b><span>In view</span></div><div><b>${avg('alt').toLocaleString()}</b><span>Avg alt (ft)</span></div><div><b>${avg('gs')}</b><span>Avg speed (kt)</span></div></div><h3>Altitude bands</h3><div class="list">${bands.map(b=>`<div class="li"><span style="width:84px">${b[0]}</span><div style="flex:1;margin:0 10px"><div class="bar2" style="width:${b[1]/mx*100}%"></div></div><span>${b[1]}</span></div>`).join('')}</div>
+  h+=`<h2>Analytics</h2><div class="grid"><div><b>${v.length}</b><span>In view</span></div><div><b>${avg('alt').toLocaleString()}</b><span>Avg alt (ft)</span></div><div><b>${avg('gs')}</b><span>Avg speed (kt)</span></div></div><h3>Weather · ${esc(selectedLocation.name)}</h3>${weatherBlock}<p>General conditions only; not an aviation weather briefing. Map clicks or place search change the selected point.</p><button class="btn s" data-a="geocoder">Location search settings</button><h3>Altitude bands</h3><div class="list">${bands.map(b=>`<div class="li"><span style="width:84px">${b[0]}</span><div style="flex:1;margin:0 10px"><div class="bar2" style="width:${b[1]/mx*100}%"></div></div><span>${b[1]}</span></div>`).join('')}</div>
   <h3>Airport traffic (30 nm)</h3><select id="ap">${Object.entries(AP).map(([k,x])=>`<option value="${k}" ${k===apc?'selected':''}>${k} · ${x[0]}</option>`).join('')}</select>
   <div class="grid"><div><b>${near.length}</b><span>Nearby</span></div><div><b>${near.filter(a=>a.alt>0&&a.alt<8000&&a.vr<-200).length}</b><span>Arriving</span></div><div><b>${near.filter(a=>a.alt>0&&a.alt<8000&&a.vr>200).length}</b><span>Departing</span></div></div><button class="btn s" style="width:100%" data-a="goap">Show ${ap[0]} on map</button>`;
  }
  if(tab==='alr'){
-  h+=`<h2>Alerts</h2><p>Watch a callsign prefix, registration or ICAO hex.</p><div class="btns"><input class="in" id="wi" placeholder="e.g. AIC, VT-ANA, 800C1A"><button class="btn" style="flex:0 0 80px" data-a="addw">Add</button></div>
+  h+=`<h2>Alerts</h2><button class="btn s" data-a="notif">${'Notification'in window?(Notification.permission==='granted'?'Browser notifications enabled':'Enable browser notifications'):'Notifications unsupported'}</button><p>Watch a callsign prefix, registration or ICAO hex.</p><div class="btns"><input class="in" id="wi" placeholder="e.g. AIC, VT-ANA, 800C1A"><button class="btn" style="flex:0 0 80px" data-a="addw">Add</button></div>
   <h3>Watching</h3><div class="list">${watch.map((w,i)=>`<div class="li"><span>${w}</span><button class="x" data-a="delw" data-i="${i}">✕</button></div>`).join('')||'<div class="li"><span style="color:var(--sub)">Nothing yet</span></div>'}</div>
   <h3>Patterns</h3><div class="list"><div class="li"><span>Emergency squawk (7500, 7600, 7700)</span><input type="checkbox" id="em" ${emerg?'checked':''}></div></div>`;
+ }
+ if(tab==='tools'){
+  h+=`<h2>Device tools</h2><p>These tools run on this device. Camera captures are saved locally and never uploaded.</p><div class="btns"><button class="btn s" data-a="fullscreen">${document.fullscreenElement?'Exit full screen':'Full screen radar'}</button><button class="btn s" data-a="wake">${keepAwake?'Release screen wake lock':'Keep screen awake'}</button></div><div class="btns"><button class="btn s" data-a="compass">${compassOn?'Turn compass off':'Orient radar with device'}</button><button class="btn s" data-a="camera">Open spotter camera</button></div><div class="btns"><button class="btn s" data-a="periodic">Enable periodic status sync</button></div><p>Background sync availability depends on browser support and installation; push delivery needs a configured push server.</p>`;
  }
  if(tab==='exp'){
   h+=`<h2>Export</h2><p>${v.length} aircraft in view · ${hist.size} tracks this session</p><div class="btns"><button class="btn" data-a="csv">CSV</button><button class="btn" data-a="json">JSON</button></div><div class="btns"><button class="btn s" data-a="hjson">All tracks (JSON)</button></div>`;
@@ -198,6 +323,17 @@ function dl(name,type,text){const a=document.createElement('a');a.href=URL.creat
 document.addEventListener('click',e=>{
  const t=e.target.closest('[data-a]');if(t){const a=t.dataset.a,v=[...ac.values()],ts=new Date().toISOString().slice(0,19).replace(/[:T]/g,'-');
   if(a==='close')close();
+  if(a==='notif')enableNotifications();
+  if(a==='fullscreen'){if(document.fullscreenElement)document.exitFullscreen?.().catch(()=>toast('Could not exit full screen.'));else document.documentElement.requestFullscreen?.().catch(e=>toast('Full screen unavailable: '+e.message));setTimeout(()=>{if(tab==='tools')panel()},100)}
+  if(a==='wake')toggleWakeLock();
+  if(a==='compass')toggleCompass();
+  if(a==='camera')openCamera();
+  if(a==='cameraClose')closeCamera();
+  if(a==='capture')capturePhoto();
+  if(a==='periodic')enablePeriodicSync();
+  if(a==='share')shareAircraft(false);
+  if(a==='copy')shareAircraft(true);
+  if(a==='geocoder'){const value=prompt('Geocoder base URL (Nominatim-compatible). Leave blank to restore the default.',geocoderBase());if(value!==null){const base=value.trim().replace(/\/+$/,'');if(base){try{const u=new URL(base);if(!['https:','http:'].includes(u.protocol)||u.protocol==='http:'&&location.protocol==='https:')throw Error()}catch{toast('Enter a valid geocoder HTTPS URL.');return}}sv('geocoderBase',base||'https://nominatim.openstreetmap.org');locationCache.clear();toast('Location search provider saved.')}}
   if(a==='watch'){const x=ac.get(sel),k=(x.cs||x.reg||x.id).toUpperCase();if(!watch.includes(k)){watch.push(k);sv('watch',watch)}toast('Watching '+k)}
   if(a==='trk'){const x=ac.get(sel);dl(`track-${sel}.json`,'application/json',JSON.stringify({aircraft:x?{icao:x.id,callsign:x.cs,registration:x.reg,type:x.type,operator:x.op}:null,source:x?.source,evidence_type:x?.evidenceType,observed_at:x?.observedAt||null,received_at:x?.receivedAt||null,points:(hist.get(sel)||[]).map(p=>({time:new Date(p[0]).toISOString(),lon:p[1],lat:p[2],alt_ft:p[3],gs_kt:p[4],track:p[5]}))},null,1))}
   if(a==='addw'){const i=$('#wi'),k=i.value.trim().toUpperCase();if(k&&!watch.includes(k)){watch.push(k);sv('watch',watch)}tab='alr';$('#panel')._tab=0;panel()}
@@ -214,7 +350,7 @@ $('#th').onclick=()=>{const t=dark()?'light':'dark';theme(t);sv('theme',t)};
 $('#sourceStatus').onclick=()=>{const current=ls('apiBase',''),value=prompt('AirOps backend base URL (for example https://api.example.com). Leave blank to use the public Airplanes.Live feed directly.',current);if(value===null)return;const base=value.trim().replace(/\/+$/,'');if(base){try{const u=new URL(base);if(!['https:','http:'].includes(u.protocol))throw Error();if(u.protocol==='http:'&&location.protocol==='https:')throw Error();}catch{toast('Enter a valid HTTPS API URL (HTTP is allowed only on a local page).');return}}sv('apiBase',base);provider='Connecting';statusLabel();if(base)toast('AirOps API saved. Reconnecting…');else toast('Using direct Airplanes.Live source…');poll()};
 const dark=()=>document.documentElement.dataset.theme==='dark';
 $('#q').oninput=e=>{qs=e.target.value.trim().toLowerCase();draw()};
-$('#q').onkeydown=e=>{if(e.key==='Enter'){const a=vis()[0];if(a){open(a.id);map.flyTo({center:[a.lon,a.lat],zoom:9})}}};
+$('#q').onkeydown=e=>{if(e.key==='Enter'){const a=vis()[0];if(a){open(a.id);map.flyTo({center:[a.lon,a.lat],zoom:9})}else if(e.target.value.trim())searchPlace(e.target.value.trim())}};
 </script>
 </body>
 </html>
