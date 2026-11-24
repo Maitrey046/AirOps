@@ -18,6 +18,7 @@ html,body{height:100%;margin:0;font:15px/1.35 -apple-system,BlinkMacSystemFont,"
 #q{flex:1;min-width:0;border:0;background:none;color:var(--tx);font:inherit;outline:0}
 #q::placeholder{color:var(--sub)}
 #n{color:var(--sub);font-variant-numeric:tabular-nums;font-size:13px;white-space:nowrap}
+#sourceStatus{position:fixed;top:calc(env(safe-area-inset-top,0px) + 58px);left:50%;transform:translateX(-50%);z-index:5;border-radius:99px;padding:5px 10px;font-size:11px;color:var(--sub);white-space:nowrap;cursor:pointer}
 .ib{border:0;border-radius:12px;height:40px;min-width:40px;padding:0 12px;color:var(--blue);font:600 14px inherit;font-family:inherit;cursor:pointer}
 .ib.on{background:var(--blue);color:#fff}
 .panel{position:fixed;left:10px;right:10px;max-width:520px;margin:auto;bottom:calc(env(safe-area-inset-bottom,0px) + 74px);border-radius:20px;padding:10px 16px 16px;z-index:6;max-height:56vh;overflow:auto}
@@ -56,6 +57,7 @@ select,.in{width:100%;height:40px;border-radius:10px;border:0;background:var(--f
   <div class="bar g"><span style="color:var(--sub)">⌕</span><input id="q" placeholder="Callsign, registration, type" autocomplete="off"><span id="n">–</span></div>
   <button class="ib g" id="heat">Heat</button><button class="ib g" id="th">◐</button>
 </div>
+<button id="sourceStatus" class="g" type="button" aria-label="Data source status">Connecting to data source…</button>
 <div id="toast" class="g"></div>
 <div id="sheet" class="panel g" hidden></div>
 <div id="panel" class="panel g" hidden></div>
@@ -67,7 +69,7 @@ const $=s=>document.querySelector(s);
 const ls=(k,d)=>{try{return JSON.parse(localStorage.getItem(k))??d}catch{return d}};
 const sv=(k,v)=>{try{localStorage.setItem(k,JSON.stringify(v))}catch{}};
 const AP={VAPO:['Pune',18.58,73.92],VABB:['Mumbai',19.09,72.87],VIDP:['Delhi',28.56,77.10],VOBL:['Bengaluru',13.2,77.71],VOHS:['Hyderabad',17.24,78.43],VOMM:['Chennai',12.99,80.17],OMDB:['Dubai',25.25,55.36],EGLL:['London Heathrow',51.47,-0.45]};
-let ac=new Map(),hist=new Map(),sel=null,watch=ls('watch',[]),emerg=ls('emerg',true),alerted=new Set(),heat=[],pbIdx=null,tab='map',apc=ls('ap','VAPO'),heatOn=false,qs='';
+let ac=new Map(),hist=new Map(),archivedTracks=new Set(),sel=null,watch=ls('watch',[]),emerg=ls('emerg',true),alerted=new Set(),heat=[],pbIdx=null,tab='map',apc=ls('ap','VAPO'),heatOn=false,qs='',provider='Connecting',lastSuccess=null,providerError=null;
 const nm=(a,b,c,d)=>{const r=Math.PI/180,x=Math.sin((c-a)*r/2)**2+Math.cos(a*r)*Math.cos(c*r)*Math.sin((d-b)*r/2)**2;return 6371/1.852*2*Math.asin(Math.sqrt(x))};
 const fc=f=>({type:'FeatureCollection',features:f});
 const pt=(lon,lat,p={})=>({type:'Feature',properties:p,geometry:{type:'Point',coordinates:[lon,lat]}});
@@ -98,24 +100,31 @@ map.on('load',()=>{
  poll();setInterval(poll,10000);
 });
 async function poll(){
- const c=map.getCenter(),b=map.getBounds();let list;
+ const c=map.getCenter(),b=map.getBounds();let list,used='';
  try{
-  const r=Math.min(250,Math.ceil(nm(c.lat,c.lng,b.getNorth(),b.getEast())));
-  const j=await(await fetch(`https://api.airplanes.live/v2/point/${c.lat.toFixed(3)}/${c.lng.toFixed(3)}/${r}`)).json();
-  list=(j.ac||[]).filter(a=>a.lat!=null).map(a=>({id:a.hex,cs:(a.flight||'').trim(),reg:a.r||'',type:a.t||'',op:a.ownOp||'',lat:a.lat,lon:a.lon,alt:a.alt_baro==='ground'?0:Math.round(a.alt_baro||0),gs:Math.round(a.gs||0),trk:Math.round(a.track||0),vr:a.baro_rate||0,sq:a.squawk||''}));
+  const r=await fetch('/api/aircraft',{headers:{'Accept':'application/json'}});if(!r.ok)throw Error('AirOps API unavailable');
+  const rows=await r.json();if(!Array.isArray(rows))throw Error('Invalid AirOps API response');
+  list=rows.filter(a=>a.latitude!=null&&a.longitude!=null&&b.contains([a.longitude,a.latitude])).map(a=>({id:a.icao,cs:a.callsign||'',reg:a.registration||'',type:a.aircraft_type||'',op:a.operator||'',lat:a.latitude,lon:a.longitude,alt:a.altitude_ft??0,gs:a.ground_speed_kt||0,trk:a.track_deg||0,vr:a.vertical_rate_fpm||0,sq:a.squawk||'',source:a.provider,observedAt:a.observed_at,receivedAt:a.received_at,freshness:a.freshness_seconds,evidenceType:a.evidence_type,availableFields:a.available_fields,missingFields:a.missing_fields}));used='AirOps API';
  }catch{
   try{
-   const j=await(await fetch(`https://opensky-network.org/api/states/all?lamin=${b.getSouth()}&lomin=${b.getWest()}&lamax=${b.getNorth()}&lomax=${b.getEast()}`)).json();
-   list=(j.states||[]).filter(s=>s[6]!=null).map(s=>({id:s[0],cs:(s[1]||'').trim(),reg:'',type:'',op:s[2],lat:s[6],lon:s[5],alt:Math.round((s[7]||0)*3.281),gs:Math.round((s[9]||0)*1.944),trk:Math.round(s[10]||0),vr:Math.round((s[11]||0)*196.85),sq:s[14]||''}));
-  }catch{$('#n').textContent='Offline';return}
+   const r=Math.min(250,Math.ceil(nm(c.lat,c.lng,b.getNorth(),b.getEast())));
+   const response=await fetch(`https://api.airplanes.live/v2/point/${c.lat.toFixed(3)}/${c.lng.toFixed(3)}/${r}`);if(!response.ok)throw Error('Airplanes.Live unavailable');const j=await response.json();
+   list=(j.ac||[]).filter(a=>a.lat!=null).map(a=>({id:a.hex,cs:(a.flight||'').trim(),reg:a.r||'',type:a.t||'',op:a.ownOp||'',lat:a.lat,lon:a.lon,alt:a.alt_baro==='ground'?0:Math.round(a.alt_baro||0),gs:Math.round(a.gs||0),trk:Math.round(a.track||0),vr:a.baro_rate||0,sq:a.squawk||''}));used='Airplanes.Live';
+  }catch{
+   try{
+    const response=await fetch(`https://opensky-network.org/api/states/all?lamin=${b.getSouth()}&lomin=${b.getWest()}&lamax=${b.getNorth()}&lomax=${b.getEast()}`);if(!response.ok)throw Error('OpenSky unavailable');const j=await response.json();
+    list=(j.states||[]).filter(s=>s[6]!=null).map(s=>({id:s[0],cs:(s[1]||'').trim(),reg:'',type:'',op:s[2],lat:s[6],lon:s[5],alt:Math.round((s[7]||0)*3.281),gs:Math.round((s[9]||0)*1.944),trk:Math.round(s[10]||0),vr:Math.round((s[11]||0)*196.85),sq:s[14]||''}));used='OpenSky Network';
+   }catch(err){providerError=err.message;provider='Offline';statusLabel();$('#n').textContent='Offline';return}
+  }
  }
- const t=Date.now();ac=new Map(list.map(a=>[a.id,a]));
+ provider=used;lastSuccess=Date.now();providerError=null;statusLabel();const t=Date.now();list=list.map(a=>({...a,source:a.source||used,receivedAt:a.receivedAt||new Date(t).toISOString(),evidenceType:a.evidenceType||'provider-reported'}));ac=new Map(list.map(a=>[a.id,a]));
  for(const a of list){const h=hist.get(a.id)||[];const l=h[h.length-1];if(!l||l[1]!==a.lon||l[2]!==a.lat){h.push([t,a.lon,a.lat,a.alt,a.gs,a.trk]);if(h.length>240)h.shift()}hist.set(a.id,h);heat.push([a.lon,a.lat]);check(a)}
  if(heat.length>15000)heat=heat.slice(-15000);
  if(hist.size>4000)for(const k of hist.keys()){if(!ac.has(k))hist.delete(k);if(hist.size<3000)break}
  map.getSource('heat').setData(fc(heat.map(p=>pt(p[0],p[1]))));
  draw();if(sel)stats();if(tab!=='map')panel();
 }
+function statusLabel(){const e=$('#sourceStatus');if(!e)return;e.textContent=provider==='Offline'?'Offline · last update '+(lastSuccess?new Date(lastSuccess).toLocaleTimeString():'none'):provider+(lastSuccess?' · updated '+new Date(lastSuccess).toLocaleTimeString():'');e.title=providerError||'Provider-reported data. Without the AirOps API, history is held in this browser session only.';e.style.color=provider==='Offline'?'var(--red)':'var(--sub)'}
 function vis(){return[...ac.values()].filter(a=>!qs||[a.cs,a.reg,a.type,a.id,a.op].some(x=>x&&x.toLowerCase().includes(qs)))}
 function draw(){const v=vis();map.getSource('ac').setData(fc(v.map(a=>pt(a.lon,a.lat,{id:a.id,cs:a.cs,trk:a.trk,sel:a.id===sel?1:0,al:['7500','7600','7700'].includes(a.sq)}))));$('#n').textContent=v.length+' aircraft'}
 function check(a){
@@ -133,7 +142,15 @@ function open(id){
  <div class="btns"><button class="btn" data-a="watch">Alert me</button><button class="btn s" data-a="trk">Export track</button></div>`;
  $('#pbr').oninput=e=>{const h=hist.get(sel)||[];const i=+e.target.value;pbIdx=i>=h.length-1?null:i;stats()};
  const a=ac.get(id);if(a&&map.getZoom()<8)map.easeTo({center:[a.lon,a.lat],zoom:8});
- stats();draw();
+ stats();draw();if(provider==='AirOps API'&&!archivedTracks.has(id))loadArchivedTrack(id);
+}
+async function loadArchivedTrack(id){
+ try{
+  const response=await fetch(`/api/history/${encodeURIComponent(id)}?limit=5000`);if(!response.ok)throw Error('Archive unavailable');
+  const rows=await response.json();if(!Array.isArray(rows))throw Error('Invalid archive response');
+  const points=rows.map(a=>[Date.parse(a.observed_at||a.received_at),a.longitude,a.latitude,a.altitude_ft||0,a.ground_speed_kt||0,a.track_deg||0]).filter(p=>Number.isFinite(p[0])&&Number.isFinite(p[1])&&Number.isFinite(p[2]));
+  if(points.length&&sel===id){hist.set(id,points);archivedTracks.add(id);stats()}
+ }catch{}
 }
 function stats(){
  const a=ac.get(sel);if(!a){close();return}
@@ -148,7 +165,7 @@ function stats(){
  $('#g4').textContent=(a.vr>0?'+':'')+a.vr+' fpm';$('#g5').textContent=a.sq||'–';$('#g6').textContent=a.id.toUpperCase();
  const mx=Math.max(1,...h.map(x=>x[3]));
  $('#sp').innerHTML=h.length>1?`<polyline fill="none" stroke="#0a84ff" stroke-width="2" vector-effect="non-scaling-stroke" points="${h.map((x,i)=>`${i/(h.length-1)*300},${38-x[3]/mx*36}`).join(' ')}"/>`:'';
- $('#pbt').textContent=live?`Live · ${h.length} points recorded this session`:`${Math.round((Date.now()-p[0])/1000)} s ago`;
+ $('#pbt').textContent=live?`Live · ${h.length} ${archivedTracks.has(sel)?'archived observations':'points recorded this session'}`:`${new Date(p[0]).toLocaleString()}${archivedTracks.has(sel)?' · archived':' · session capture'}`;
  map.getSource('trail').setData(fc(h.length>1?[{type:'Feature',properties:{},geometry:{type:'LineString',coordinates:h.map(x=>[x[1],x[2]])}}]:[]));
  map.getSource('pb').setData(fc(p?[pt(p[1],p[2])]:[]));
 }
@@ -182,11 +199,11 @@ document.addEventListener('click',e=>{
  const t=e.target.closest('[data-a]');if(t){const a=t.dataset.a,v=[...ac.values()],ts=new Date().toISOString().slice(0,19).replace(/[:T]/g,'-');
   if(a==='close')close();
   if(a==='watch'){const x=ac.get(sel),k=(x.cs||x.reg||x.id).toUpperCase();if(!watch.includes(k)){watch.push(k);sv('watch',watch)}toast('Watching '+k)}
-  if(a==='trk')dl(`track-${sel}.json`,'application/json',JSON.stringify((hist.get(sel)||[]).map(p=>({time:new Date(p[0]).toISOString(),lon:p[1],lat:p[2],alt_ft:p[3],gs_kt:p[4],track:p[5]})),null,1));
+  if(a==='trk'){const x=ac.get(sel);dl(`track-${sel}.json`,'application/json',JSON.stringify({aircraft:x?{icao:x.id,callsign:x.cs,registration:x.reg,type:x.type,operator:x.op}:null,source:x?.source,evidence_type:x?.evidenceType,observed_at:x?.observedAt||null,received_at:x?.receivedAt||null,points:(hist.get(sel)||[]).map(p=>({time:new Date(p[0]).toISOString(),lon:p[1],lat:p[2],alt_ft:p[3],gs_kt:p[4],track:p[5]}))},null,1))}
   if(a==='addw'){const i=$('#wi'),k=i.value.trim().toUpperCase();if(k&&!watch.includes(k)){watch.push(k);sv('watch',watch)}tab='alr';$('#panel')._tab=0;panel()}
   if(a==='delw'){watch.splice(+t.dataset.i,1);sv('watch',watch);$('#panel')._tab=0;panel()}
   if(a==='goap'){map.flyTo({center:[AP[apc][2],AP[apc][1]],zoom:9});tab='map';tabs();panel()}
-  if(a==='csv'){const c=['icao,callsign,registration,type,operator,lat,lon,alt_ft,gs_kt,track,vrate_fpm,squawk'];v.forEach(x=>c.push([x.id,x.cs,x.reg,x.type,x.op,x.lat,x.lon,x.alt,x.gs,x.trk,x.vr,x.sq].map(s=>`"${String(s).replace(/"/g,'""')}"`).join(',')));dl(`airops-${ts}.csv`,'text/csv',c.join('\n'))}
+  if(a==='csv'){const c=['icao,callsign,registration,type,operator,lat,lon,alt_ft,gs_kt,track,vrate_fpm,squawk,source,evidence_type,observed_at,received_at'];v.forEach(x=>c.push([x.id,x.cs,x.reg,x.type,x.op,x.lat,x.lon,x.alt,x.gs,x.trk,x.vr,x.sq,x.source,x.evidenceType,x.observedAt,x.receivedAt].map(s=>`"${String(s??'').replace(/"/g,'""')}"`).join(',')));dl(`airops-${ts}.csv`,'text/csv',c.join('\n'))}
   if(a==='json')dl(`airops-${ts}.json`,'application/json',JSON.stringify(v,null,1));
   if(a==='hjson')dl(`airops-tracks-${ts}.json`,'application/json',JSON.stringify(Object.fromEntries(hist),null,0));
  }
@@ -194,6 +211,7 @@ document.addEventListener('click',e=>{
 });
 $('#heat').onclick=e=>{heatOn=!heatOn;e.currentTarget.classList.toggle('on',heatOn);map.setLayoutProperty('heat','visibility',heatOn?'visible':'none')};
 $('#th').onclick=()=>{const t=dark()?'light':'dark';theme(t);sv('theme',t)};
+$('#sourceStatus').onclick=()=>toast(provider==='Offline'?(providerError||'No provider response.'):provider+' · last successful response '+(lastSuccess?new Date(lastSuccess).toLocaleString():'not yet')+(provider==='AirOps API'?' · observations are persisted by the backend':' · history is session-only'));
 const dark=()=>document.documentElement.dataset.theme==='dark';
 $('#q').oninput=e=>{qs=e.target.value.trim().toLowerCase();draw()};
 $('#q').onkeydown=e=>{if(e.key==='Enter'){const a=vis()[0];if(a){open(a.id);map.flyTo({center:[a.lon,a.lat],zoom:9})}}};
