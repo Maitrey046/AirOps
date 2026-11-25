@@ -49,10 +49,16 @@ input[type=range]{width:100%;accent-color:var(--blue)}
 .li:first-child{border-top:0}
 .bar2{height:8px;border-radius:4px;background:var(--blue);min-width:2px}
 select,.in{width:100%;height:40px;border-radius:10px;border:0;background:var(--fill);color:var(--tx);font:inherit;padding:0 12px}
-#tabs{position:fixed;left:10px;right:10px;max-width:520px;margin:auto;bottom:calc(env(safe-area-inset-bottom,0px) + 10px);height:56px;border-radius:28px;display:flex;z-index:7}
-#tabs button{flex:1;border:0;background:none;color:var(--sub);font:500 11px inherit;font-family:inherit;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1px;cursor:pointer}
+#tabs{position:fixed;left:10px;right:10px;max-width:520px;margin:auto;bottom:calc(env(safe-area-inset-bottom,0px) + 10px);height:56px;border-radius:28px;display:flex;z-index:7;overflow:hidden;isolation:isolate;touch-action:none}
+#tabs button{position:relative;z-index:2;flex:1;min-width:0;border:0;background:none;color:var(--sub);font:500 11px inherit;font-family:inherit;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1px;cursor:pointer;touch-action:none;transition:color .22s ease}
 #tabs button i{font-style:normal;font-size:19px}
 #tabs button.on{color:var(--blue)}
+#tabs button.preview{color:var(--blue)}
+#glassThumb{position:absolute;z-index:1;left:4px;top:4px;bottom:4px;width:calc((100% - 8px)/5);border:1px solid rgba(255,255,255,.42);border-radius:24px;pointer-events:none;transform:translate3d(var(--thumb-x,0px),0,0) rotate(var(--thumb-tilt,0deg)) scale(var(--thumb-squish,1),var(--thumb-tall,1));transform-origin:center;background:linear-gradient(145deg,rgba(255,255,255,.34),rgba(255,255,255,.10) 38%,rgba(255,255,255,.20) 68%,rgba(255,255,255,.07));-webkit-backdrop-filter:blur(22px) saturate(220%) contrast(1.08);backdrop-filter:blur(22px) saturate(220%) contrast(1.08);box-shadow:inset 0 1px 0 rgba(255,255,255,.52),inset 0 -1px 0 rgba(255,255,255,.12),0 5px 18px rgba(0,0,0,.24);transition:transform .48s cubic-bezier(.2,1.25,.35,1),background .25s ease,border-color .25s ease}
+#glassThumb:before{content:"";position:absolute;inset:1px;border-radius:inherit;background:radial-gradient(ellipse at 25% 0,rgba(255,255,255,.40),transparent 52%);opacity:.85}
+#glassThumb:after{content:"";position:absolute;left:12%;right:12%;top:1px;height:1px;border-radius:50%;background:rgba(255,255,255,.68);filter:blur(.4px)}
+#tabs.dragging #glassThumb{transition:none;background:linear-gradient(140deg,rgba(255,255,255,.44),rgba(255,255,255,.14) 42%,rgba(255,255,255,.26));border-color:rgba(255,255,255,.62);box-shadow:inset 0 1.5px 0 rgba(255,255,255,.68),inset 0 -1px 0 rgba(255,255,255,.2),0 9px 24px rgba(0,0,0,.32),0 0 18px rgba(120,190,255,.12)}
+@media(prefers-reduced-motion:reduce){#glassThumb,#tabs button{transition:none!important}}
 #toast{position:fixed;top:calc(env(safe-area-inset-top,0px) + 58px);left:50%;transform:translateX(-50%);z-index:9;padding:10px 16px;border-radius:14px;font-weight:600;display:none;max-width:90%}
 .maplibregl-ctrl-bottom-left,.maplibregl-ctrl-bottom-right{display:none}
 </style>
@@ -70,7 +76,7 @@ select,.in{width:100%;height:40px;border-radius:10px;border:0;background:var(--f
 <div id="panel" class="panel g" hidden></div>
 <div id="cameraModal" hidden><div id="cameraBox" class="g"><div class="row"><h2>Spotter camera</h2><button class="x" data-a="cameraClose" aria-label="Close camera">✕</button></div><p>Camera frames stay on this device; AirOps does not upload them.</p><video id="camVideo" autoplay playsinline></video><canvas id="camCanvas" hidden></canvas><div class="btns"><button class="btn" data-a="capture">Capture photo</button><button class="btn s" data-a="cameraClose">Close</button></div></div></div>
 <nav id="tabs" class="g">
-  <button data-t="map" class="on"><i>◉</i>Map</button><button data-t="ana"><i>▥</i>Analytics</button><button data-t="alr"><i>◔</i>Alerts</button><button data-t="exp"><i>⇪</i>Export</button><button data-t="tools"><i>⋯</i>Tools</button>
+  <span id="glassThumb" aria-hidden="true"></span><button data-t="map" class="on"><i>◉</i>Map</button><button data-t="ana"><i>▥</i>Analytics</button><button data-t="alr"><i>◔</i>Alerts</button><button data-t="exp"><i>⇪</i>Export</button><button data-t="tools"><i>⋯</i>Tools</button>
 </nav>
 <script>
 const $=s=>document.querySelector(s);
@@ -291,7 +297,34 @@ function stats(){
  map.getSource('pb').setData(fc(p?[pt(p[1],p[2])]:[]));
 }
 function close(){sel=null;pbIdx=null;$('#sheet').hidden=true;if(map.getSource('trail')){map.getSource('trail').setData(fc([]));map.getSource('pb').setData(fc([]));draw()}}
-function tabs(){document.querySelectorAll('#tabs button').forEach(b=>b.classList.toggle('on',b.dataset.t===tab))}
+function tabs(){
+ const nav=$('#tabs'),buttons=[...nav.querySelectorAll('button[data-t]')],index=Math.max(0,buttons.findIndex(b=>b.dataset.t===tab)),segment=(nav.clientWidth-8)/buttons.length;
+ buttons.forEach((b,i)=>{b.classList.toggle('on',b.dataset.t===tab);b.setAttribute('aria-current',b.dataset.t===tab?'page':'false')});
+ $('#glassThumb').style.width=`${segment}px`;nav.style.setProperty('--thumb-x',`${index*segment}px`);nav.style.setProperty('--thumb-squish','1');nav.style.setProperty('--thumb-tall','1');nav.style.setProperty('--thumb-tilt','0deg');
+}
+function activateTab(key){tab=key;if(tab!=='map'){sel=null;$('#sheet').hidden=true;draw()}$('#panel')._tab=0;tabs();panel()}
+let glassGesture=null,suppressTabClickUntil=0;
+const navTabs=$('#tabs');
+navTabs.addEventListener('pointerdown',e=>{
+ const button=e.target.closest('button[data-t]');if(!button||button.dataset.t!==tab||!e.isPrimary)return;
+ const buttons=[...navTabs.querySelectorAll('button[data-t]')],rect=navTabs.getBoundingClientRect(),segment=(rect.width-8)/buttons.length,index=buttons.findIndex(b=>b.dataset.t===tab);
+ glassGesture={pointerId:e.pointerId,startX:e.clientX,lastX:e.clientX,lastAt:performance.now(),origin:index,index,segment,rect};navTabs.classList.add('dragging');button.focus({preventScroll:true});navTabs.setPointerCapture(e.pointerId);e.preventDefault();
+});
+navTabs.addEventListener('pointermove',e=>{
+ if(!glassGesture||glassGesture.pointerId!==e.pointerId)return;
+ const g=glassGesture,buttons=[...navTabs.querySelectorAll('button[data-t]')],raw=e.clientX-g.rect.left-g.segment/2-4,x=Math.max(0,Math.min(g.rect.width-8-g.segment,raw)),index=Math.max(0,Math.min(buttons.length-1,Math.round(x/g.segment))),now=performance.now(),velocity=(e.clientX-g.lastX)/Math.max(1,now-g.lastAt),stretch=1+Math.min(.16,Math.abs(velocity)*.035);
+ navTabs.style.setProperty('--thumb-x',`${x}px`);navTabs.style.setProperty('--thumb-squish',stretch.toFixed(3));navTabs.style.setProperty('--thumb-tall',(1-(stretch-1)*.45).toFixed(3));navTabs.style.setProperty('--thumb-tilt',`${Math.max(-5,Math.min(5,velocity*1.3))}deg`);
+ buttons.forEach((b,i)=>b.classList.toggle('preview',i===index));g.index=index;g.lastX=e.clientX;g.lastAt=now;
+});
+function finishGlassGesture(e,commit){
+ if(!glassGesture||glassGesture.pointerId!==e.pointerId)return;
+ const g=glassGesture,buttons=[...navTabs.querySelectorAll('button[data-t]')],target=buttons[commit?g.index:g.origin]?.dataset.t;
+ glassGesture=null;navTabs.classList.remove('dragging');buttons.forEach(b=>b.classList.remove('preview'));if(navTabs.hasPointerCapture(e.pointerId))navTabs.releasePointerCapture(e.pointerId);
+ navTabs.style.setProperty('--thumb-squish','1');navTabs.style.setProperty('--thumb-tall','1');navTabs.style.setProperty('--thumb-tilt','0deg');
+ if(commit){suppressTabClickUntil=Date.now()+450;activateTab(target)}else tabs();
+}
+navTabs.addEventListener('pointerup',e=>finishGlassGesture(e,true));navTabs.addEventListener('pointercancel',e=>finishGlassGesture(e,false));
+window.addEventListener('resize',()=>tabs());
 function panel(){
  const p=$('#panel');if(tab==='map'){p.hidden=true;return}
  p.hidden=false;const v=[...ac.values()];let h='<div class="grab"></div>';
@@ -343,7 +376,7 @@ document.addEventListener('click',e=>{
   if(a==='json')dl(`airops-${ts}.json`,'application/json',JSON.stringify(v,null,1));
   if(a==='hjson')dl(`airops-tracks-${ts}.json`,'application/json',JSON.stringify(Object.fromEntries(hist),null,0));
  }
- const b=e.target.closest('#tabs button');if(b){tab=b.dataset.t;if(tab!=='map'){sel=null;$('#sheet').hidden=true;draw()}$('#panel')._tab=0;tabs();panel()}
+ const b=e.target.closest('#tabs button');if(b){if(Date.now()<suppressTabClickUntil){e.preventDefault();return}activateTab(b.dataset.t)}
 });
 $('#heat').onclick=e=>{heatOn=!heatOn;e.currentTarget.classList.toggle('on',heatOn);map.setLayoutProperty('heat','visibility',heatOn?'visible':'none')};
 $('#th').onclick=()=>{const t=dark()?'light':'dark';theme(t);sv('theme',t)};
@@ -351,6 +384,7 @@ $('#sourceStatus').onclick=()=>{const current=ls('apiBase',''),value=prompt('Air
 const dark=()=>document.documentElement.dataset.theme==='dark';
 $('#q').oninput=e=>{qs=e.target.value.trim().toLowerCase();draw()};
 $('#q').onkeydown=e=>{if(e.key==='Enter'){const a=vis()[0];if(a){open(a.id);map.flyTo({center:[a.lon,a.lat],zoom:9})}else if(e.target.value.trim())searchPlace(e.target.value.trim())}};
+tabs();
 </script>
 </body>
 </html>
